@@ -68,6 +68,15 @@ export class Player {
   private hadMask = false;
   private endResolve: (() => void) | null = null;
   private preroll = false;
+  /** Smoothed cost of one frame (ms) and the resolution we settle on for this device. */
+  frameMs = 0;
+  /** Cost of the pixel work only (effects), which is what a lower resolution actually saves. */
+  private pixMs = 0;
+  private lastPix = 0;
+  private previewLong = PREVIEW_LONG;
+  private lastRenderAt = 0;
+  private lastVT = -1;
+  private slowFrames = 0;
   private blessed = new WeakSet<HTMLMediaElement>();
 
   canvas = document.createElement("canvas");
@@ -75,6 +84,7 @@ export class Player {
 
   constructor() {
     this.ctx = this.canvas.getContext("2d")!;
+    this.seg.onMask = () => this.requestRender();
     // Media elements live off-screen in the document (iOS won't decode detached videos).
     this.host.style.cssText = "position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;overflow:hidden;pointer-events:none";
     document.body.appendChild(this.host);
@@ -119,7 +129,7 @@ export class Player {
     const aspectChanged = !this.project || this.project.aspect !== p.aspect;
     this.project = p;
     this.lay = layout(p);
-    if (aspectChanged && !this.exporting) this.resize(PREVIEW_LONG);
+    if (aspectChanged && !this.exporting) this.resize(this.previewLong);
     const ids = new Set<string>([...p.clips.map((c) => c.assetId), ...p.music.map((m) => m.assetId)]);
     p.clips.forEach((c) => c.look.bg.imageId && ids.add(c.look.bg.imageId));
     Promise.all([...ids].filter((id) => !cachedAsset(id)).map(loadAsset)).then((got) => got.length && this.requestRender());
@@ -359,11 +369,30 @@ export class Player {
       }
       this.time = T;
       this.syncMedia(T);
-      this.render(T);
+      // Heavy looks (effects, transitions) are drawn at 30 fps: video is 24-30 fps anyway,
+      // and skipping the in-between frames halves the work.
+      let draw = true;
+      if (!this.exporting) {
+        if (this.heavyAt(T)) draw = now - this.lastRenderAt >= 30;
+        else {
+          // Plain clips: only redraw when the video has a new frame (or ~25 fps for text).
+          const a2 = this.active(T);
+          const vt = a2 ? this.decks[a2.a % 2].el.currentTime : -1;
+          draw = vt !== this.lastVT || now - this.lastRenderAt >= 40;
+          this.lastVT = vt;
+        }
+      }
+      if (draw) this.render(T);
       this.onTime(T);
       this.raf = requestAnimationFrame(loop);
     };
     this.raf = requestAnimationFrame(loop);
+  }
+
+  private heavyAt(T: number) {
+    const act = this.active(Math.min(T, Math.max(0, this.lay.videoEnd - 0.001)));
+    if (!act) return false;
+    return act.b >= 0 || lookActive(this.project.clips[act.a].look);
   }
 
   pause() {
@@ -518,7 +547,31 @@ export class Player {
     return true;
   }
 
+  /** Draws one frame and keeps track of how long it took; steps the preview resolution
+   *  down when this device can't keep up, so playback stays smooth. */
   render(T: number) {
+    const t0 = performance.now();
+    this.renderFrame(T);
+    const ms = performance.now() - t0;
+    this.lastRenderAt = t0;
+    this.frameMs = this.frameMs ? this.frameMs * 0.85 + ms * 0.15 : ms;
+    this.pixMs = this.pixMs ? this.pixMs * 0.85 + this.lastPix * 0.15 : this.lastPix;
+    this.lastPix = 0;
+    if (this.playing && !this.exporting && !this.preroll) {
+      this.slowFrames = this.pixMs > 15 ? this.slowFrames + 1 : 0;
+      if (this.slowFrames > 20 && this.previewLong > 426) {
+        const steps = [854, 720, 640, 540, 480, 426];
+        const next = steps.find((v) => v < this.previewLong) ?? 426;
+        this.previewLong = next;
+        this.slowFrames = 0;
+        this.frameMs = 0;
+        this.pixMs = 0;
+        this.resize(next);
+      }
+    }
+  }
+
+  private renderFrame(T: number) {
     const { ctx, w, h } = this;
     if (!w || !this.project) return;
     const p = this.project;
@@ -535,10 +588,13 @@ export class Player {
         if (A.look.cutout && A.look.bg.mode === 3) this.loadBgImage(A.look.bg.imageId);
         this.wctx.fillRect(0, 0, w, h);
         this.drawClip(this.wctx, act.a, T);
-        fx.pixels(0).set(this.wctx.getImageData(0, 0, w, h).data);
+        const qp = performance.now();
+        const gid = this.wctx.getImageData(0, 0, w, h);
+        fx.pixels(0).set(gid.data);
         let hasMask = false;
         if (needsMask(A.look)) {
-          const r = this.seg.run(this.work, w, h);
+          // Segmentation runs in a worker: send this frame, use the newest finished mask.
+          const r = this.seg.run(this.work, w, h, this.playing || this.exporting ? -1 : Math.round(T * 1000));
           if (r) { fx.setMask(r.mask, r.w, r.h, this.playing ? 0.35 : 0); this.hadMask = true; }
           hasMask = this.hadMask;
           if (!r && !this.seg.ready) {
@@ -559,6 +615,7 @@ export class Player {
           fx.transition(kind, act.t);
         }
         ctx.putImageData(fx.imageData(), 0, 0);
+        this.lastPix = performance.now() - qp;
       } else {
         this.drawClip(ctx, act.a, T);
       }
@@ -760,7 +817,7 @@ export class Player {
     this.monitor!.gain.value = 1;
     this.exporting = false;
     this.selectedText = prevSel;
-    this.resize(PREVIEW_LONG);
+    this.resize(this.previewLong);
     this.seek(0);
     const type = (mime || chunks[0]?.type || "video/mp4").split(";")[0];
     return signal.cancel ? null : new Blob(chunks, { type });

@@ -7,76 +7,69 @@ const SEG_MODEL = "https://storage.googleapis.com/mediapipe-models/image_segment
 // Bypass the bundler: these are plain ES modules from the CDN.
 const dynImport = new Function("u", "return import(u)") as (u: string) => Promise<Record<string, unknown>>;
 
-type Mask = { getAsFloat32Array(): Float32Array; close(): void };
-type SegResult = { confidenceMasks?: Mask[]; close?: () => void };
-type Segmenter = { segmentForVideo(src: CanvasImageSource, ts: number): SegResult };
+export type SegMask = { mask: Uint8Array; w: number; h: number };
 
+/** Finds the person in a frame. Runs in a worker; `run` never blocks, it hands back the
+ *  newest finished mask (once) and queues the next frame when the worker is free. */
 export class PersonSegmenter {
-  private seg: Segmenter | null = null;
-  private loading: Promise<void> | null = null;
+  private w: Worker | null = null;
+  private starting: Promise<void> | null = null;
+  private busy = false;
+  private fresh: SegMask | null = null;
   private canvas = document.createElement("canvas");
-  private ctx = this.canvas.getContext("2d", { willReadFrequently: true })!;
-  private lastTs = 0;
+  private ctx = this.canvas.getContext("2d", { willReadFrequently: false })!;
   failed = false;
+  ready = false;
+  private lastKey = -2;
+  /** Called when a new mask arrives (so a paused preview can redraw). */
+  onMask: () => void = () => {};
 
   load() {
-    this.loading ??= (async () => {
+    this.starting ??= new Promise<void>((resolve) => {
       try {
-        const vision = (await dynImport(VISION + "vision_bundle.mjs")) as {
-          FilesetResolver: { forVisionTasks(p: string): Promise<unknown> };
-          ImageSegmenter: { createFromOptions(f: unknown, o: unknown): Promise<Segmenter> };
+        const w = new Worker("/seg-worker.js");
+        this.w = w;
+        w.onmessage = (e) => {
+          const d = e.data;
+          if (d.type === "ready") { this.ready = true; resolve(); }
+          else if (d.type === "mask") {
+            this.busy = false;
+            if (!d.empty) { this.fresh = { mask: d.mask, w: d.w, h: d.h }; this.onMask(); }
+          } else if (d.type === "error") {
+            this.busy = false;
+            if (!this.ready) { this.failed = true; resolve(); }
+            console.warn("Segmentation:", d.error);
+          }
         };
-        const files = await vision.FilesetResolver.forVisionTasks(VISION + "wasm");
-        const make = (delegate: "GPU" | "CPU") =>
-          vision.ImageSegmenter.createFromOptions(files, {
-            baseOptions: { modelAssetPath: SEG_MODEL, delegate },
-            runningMode: "VIDEO",
-            outputCategoryMask: false,
-            outputConfidenceMasks: true,
-          });
-        try {
-          this.seg = await make("GPU");
-        } catch {
-          this.seg = await make("CPU");
-        }
-      } catch (e) {
+        w.onerror = () => { this.failed = true; resolve(); };
+        w.postMessage({ type: "init" });
+      } catch {
         this.failed = true;
-        console.warn("Segmentation unavailable", e);
+        resolve();
       }
-    })();
-    return this.loading;
+    });
+    return this.starting;
   }
 
-  get ready() {
-    return !!this.seg;
-  }
-
-  /** Returns a small person-confidence mask for the frame, or null if not ready. */
-  run(src: CanvasImageSource, w: number, h: number): { mask: Float32Array; w: number; h: number } | null {
-    if (!this.seg) {
-      if (!this.failed) this.load();
-      return null;
+  /** Sends this frame for analysis if the worker is free; returns a finished mask if one arrived. */
+  run(src: CanvasImageSource, w: number, h: number, key = -1): SegMask | null {
+    if (!this.w) { this.load(); return null; }
+    // key >= 0 (paused preview): analyse each moment once, so a redraw doesn't loop.
+    if (this.ready && !this.busy && (key < 0 || key !== this.lastKey)) {
+      this.lastKey = key;
+      const s = 256 / Math.max(w, h);
+      const sw = Math.max(16, Math.round(w * s));
+      const sh = Math.max(16, Math.round(h * s));
+      if (this.canvas.width !== sw || this.canvas.height !== sh) { this.canvas.width = sw; this.canvas.height = sh; }
+      this.ctx.drawImage(src, 0, 0, sw, sh);
+      this.busy = true;
+      createImageBitmap(this.canvas)
+        .then((bitmap) => this.w!.postMessage({ type: "frame", bitmap, w: sw, h: sh, t: performance.now() }, [bitmap]))
+        .catch(() => { this.busy = false; });
     }
-    const s = 256 / Math.max(w, h);
-    const sw = Math.max(16, Math.round(w * s));
-    const sh = Math.max(16, Math.round(h * s));
-    if (this.canvas.width !== sw || this.canvas.height !== sh) {
-      this.canvas.width = sw;
-      this.canvas.height = sh;
-    }
-    this.ctx.drawImage(src, 0, 0, sw, sh);
-    const ts = Math.max(performance.now(), this.lastTs + 1);
-    this.lastTs = ts;
-    try {
-      const r = this.seg.segmentForVideo(this.canvas, ts);
-      const m = r.confidenceMasks?.[0];
-      if (!m) return null;
-      const mask = m.getAsFloat32Array().slice();
-      r.close?.();
-      return { mask, w: sw, h: sh };
-    } catch {
-      return null;
-    }
+    const f = this.fresh;
+    this.fresh = null;
+    return f;
   }
 }
 

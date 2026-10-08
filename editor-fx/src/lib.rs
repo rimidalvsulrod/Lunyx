@@ -56,6 +56,13 @@ struct St {
     lh: usize,
     params: Vec<f32>,
     line: Vec<u8>,
+    small: Vec<u8>,
+    vigmap: Vec<u8>,
+    lkey: [f32; 16],
+    ltime: f32,
+    lvalid: bool,
+    vigkey: (usize, usize, u32),
+    noise: Vec<i8>,
     audio: Vec<f32>,
     out: Vec<f32>,
     frame: u32,
@@ -78,6 +85,13 @@ impl St {
             lh: 0,
             params: vec![0.0; P * 2],
             line: Vec::new(),
+            small: Vec::new(),
+            vigmap: Vec::new(),
+            lkey: [0.0; 16],
+            ltime: 0.0,
+            lvalid: false,
+            vigkey: (0, 0, 0),
+            noise: (0..65536u32).map(|i| ((hash(i, 11, 5) & 0xff) as i32 - 128) as i8).collect(),
             audio: Vec::new(),
             out: vec![0.0; 8192],
             frame: 0,
@@ -118,7 +132,8 @@ pub extern "C" fn setup(w: u32, h: u32) {
     s.lw = (w + 3) / 4 + 1;
     s.lh = (h + 3) / 4 + 1;
     s.light = vec![0.0; s.lw * s.lh * 4];
-    s.line = vec![0; w.max(h) * 4];
+    s.lvalid = false;
+    s.line = vec![0; n * 4];
 }
 
 #[no_mangle]
@@ -203,11 +218,13 @@ fn fbm(x: f32, y: f32) -> f32 {
 }
 
 /// Separable running-sum box blur on an RGBA buffer. Cost does not depend on the radius.
+/// `line` must hold at least w*h*4 bytes (vertical pass works row by row, which is cache friendly).
 fn box_blur(buf: &mut [u8], w: usize, h: usize, r: usize, line: &mut [u8], horizontal_only: bool) {
     if r == 0 || w == 0 || h == 0 {
         return;
     }
     let div = (2 * r + 1) as u32;
+    let inv = (65536 + div / 2) / div;
     // horizontal
     for y in 0..h {
         let row = &mut buf[y * w * 4..(y + 1) * w * 4];
@@ -223,7 +240,7 @@ fn box_blur(buf: &mut [u8], w: usize, h: usize, r: usize, line: &mut [u8], horiz
             let add = (x + r + 1).min(w - 1) * 4;
             let sub = x.saturating_sub(r) * 4;
             for c in 0..4 {
-                row[x * 4 + c] = (s[c] / div) as u8;
+                row[x * 4 + c] = ((s[c] * inv) >> 16).min(255) as u8;
                 s[c] = s[c] + line[add + c] as u32 - line[sub + c] as u32;
             }
         }
@@ -231,40 +248,103 @@ fn box_blur(buf: &mut [u8], w: usize, h: usize, r: usize, line: &mut [u8], horiz
     if horizontal_only {
         return;
     }
-    // vertical
-    for x in 0..w {
-        for y in 0..h {
-            let i = (y * w + x) * 4;
-            line[y * 4..y * 4 + 4].copy_from_slice(&buf[i..i + 4]);
+    // vertical, one whole row at a time
+    let stride = w * 4;
+    let src = &mut line[..stride * h];
+    src.copy_from_slice(&buf[..stride * h]);
+    let mut sums = vec![0u32; stride];
+    for x in 0..stride {
+        let mut v = src[x] as u32 * (r as u32 + 1);
+        for k in 1..=r {
+            v += src[k.min(h - 1) * stride + x] as u32;
         }
-        let mut s = [0u32; 4];
-        for c in 0..4 {
-            s[c] = line[c] as u32 * (r as u32 + 1);
-            for k in 1..=r {
-                s[c] += line[k.min(h - 1) * 4 + c] as u32;
-            }
-        }
-        for y in 0..h {
-            let add = (y + r + 1).min(h - 1) * 4;
-            let sub = y.saturating_sub(r) * 4;
-            let i = (y * w + x) * 4;
-            for c in 0..4 {
-                buf[i + c] = (s[c] / div) as u8;
-                s[c] = s[c] + line[add + c] as u32 - line[sub + c] as u32;
-            }
+        sums[x] = v;
+    }
+    for y in 0..h {
+        let add = (y + r + 1).min(h - 1) * stride;
+        let sub = y.saturating_sub(r) * stride;
+        let o = y * stride;
+        for x in 0..stride {
+            buf[o + x] = ((sums[x] * inv) >> 16).min(255) as u8;
+            sums[x] = sums[x] + src[add + x] as u32 - src[sub + x] as u32;
         }
     }
 }
 
-fn blur(buf: &mut [u8], w: usize, h: usize, r: f32, line: &mut [u8]) {
+/// Soft blur. Large radii work on a 2x / 4x smaller copy and scale back up, which is
+/// up to 16x less work and looks the same for a blur.
+fn blur(buf: &mut [u8], w: usize, h: usize, r: f32, line: &mut [u8], small: &mut Vec<u8>) {
     let r = r.max(0.0) as usize;
     if r == 0 {
         return;
     }
-    // Two box passes approximate a gaussian.
-    let r1 = (r / 2).max(1);
-    box_blur(buf, w, h, r1, line, false);
-    box_blur(buf, w, h, r1, line, false);
+    let f = if r >= 10 { 4 } else if r >= 5 { 2 } else { 1 };
+    if f == 1 {
+        let r1 = (r / 2).max(1);
+        box_blur(buf, w, h, r1, line, false);
+        box_blur(buf, w, h, r1, line, false);
+        return;
+    }
+    let (sw, sh) = ((w + f - 1) / f, (h + f - 1) / f);
+    if small.len() < sw * sh * 4 {
+        small.resize(sw * sh * 4, 0);
+    }
+    // box downsample (RGB)
+    for y in 0..sh {
+        let y0 = y * f;
+        let y1 = (y0 + f).min(h);
+        for x in 0..sw {
+            let x0 = x * f;
+            let x1 = (x0 + f).min(w);
+            let mut acc = [0u32; 3];
+            for yy in y0..y1 {
+                let mut i = (yy * w + x0) * 4;
+                for _ in x0..x1 {
+                    acc[0] += buf[i] as u32;
+                    acc[1] += buf[i + 1] as u32;
+                    acc[2] += buf[i + 2] as u32;
+                    i += 4;
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            let o = (y * sw + x) * 4;
+            small[o] = (acc[0] / n) as u8;
+            small[o + 1] = (acc[1] / n) as u8;
+            small[o + 2] = (acc[2] / n) as u8;
+            small[o + 3] = 255;
+        }
+    }
+    let r1 = ((r / f) / 2).max(1);
+    box_blur(&mut small[..sw * sh * 4], sw, sh, r1, line, false);
+    box_blur(&mut small[..sw * sh * 4], sw, sh, r1, line, false);
+    // bilinear upsample: blend the two source rows once per output row, then across
+    let xs: Vec<(usize, usize, u32)> = (0..w)
+        .map(|x| {
+            let fx = ((x as f32 + 0.5) / f as f32 - 0.5).max(0.0);
+            let x0 = (fx as usize).min(sw - 1);
+            (x0 * 4, (x0 + 1).min(sw - 1) * 4, ((fx - x0 as f32) * 256.0) as u32)
+        })
+        .collect();
+    let mut vrow = vec![0u32; sw * 4];
+    for y in 0..h {
+        let fy = ((y as f32 + 0.5) / f as f32 - 0.5).max(0.0);
+        let y0 = (fy as usize).min(sh - 1);
+        let y1 = (y0 + 1).min(sh - 1);
+        let ty = ((fy - y0 as f32) * 256.0) as u32;
+        let (q0, q1) = (y0 * sw * 4, y1 * sw * 4);
+        for i in 0..sw * 4 {
+            vrow[i] = (small[q0 + i] as u32 * (256 - ty) + small[q1 + i] as u32 * ty) >> 8;
+        }
+        let mut o = y * w * 4;
+        for x in 0..w {
+            let (a, b, tx) = xs[x];
+            buf[o] = ((vrow[a] * (256 - tx) + vrow[b] * tx) >> 8) as u8;
+            buf[o + 1] = ((vrow[a + 1] * (256 - tx) + vrow[b + 1] * tx) >> 8) as u8;
+            buf[o + 2] = ((vrow[a + 2] * (256 - tx) + vrow[b + 2] * tx) >> 8) as u8;
+            buf[o + 3] = 255;
+            o += 4;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- segmentation mask
@@ -444,47 +524,72 @@ fn apply_light(s: &mut St, p: &[f32], has_mask: bool) {
     let subj = clamp01(p[LIGHT_SUBJECT]);
     let sx = (lw - 1) as f32 / (w.max(2) - 1) as f32;
     let sy = (lh - 1) as f32 / (h.max(2) - 1) as f32;
+    // Per-column cell index and 8-bit blend.
+    let cols: Vec<(usize, usize, i32)> = (0..w)
+        .map(|x| {
+            let fx = x as f32 * sx;
+            let x0 = (fx as usize).min(lw - 1);
+            (x0 * 4, (x0 + 1).min(lw - 1) * 4, ((fx - x0 as f32) * 256.0) as i32)
+        })
+        .collect();
+    // How much of the light lands on a pixel, by mask value (0..256).
+    let mut kt = [256i32; 256];
+    if has_mask {
+        for m in 0..256 {
+            let mf = m as f32 / 255.0;
+            kt[m] = (((1.0 - mf) + mf * subj) * 256.0) as i32;
+        }
+    }
+    let mut lrow = vec![0i32; lw * 4];
     for y in 0..h {
         let fy = y as f32 * sy;
         let y0 = (fy as usize).min(lh - 1);
         let y1 = (y0 + 1).min(lh - 1);
         let ty = fy - y0 as f32;
+        let (r0, r1) = (y0 * lw * 4, y1 * lw * 4);
+        let mut any = false;
+        for i in 0..lw * 4 {
+            let v = s.light[r0 + i] + (s.light[r1 + i] - s.light[r0 + i]) * ty;
+            // channels: light scaled by amount, clamped to 0..1; shade (index 3) capped at 0.9
+            let q = if i & 3 == 3 { ((v * amount).min(0.9).max(0.0) * 256.0) as i32 } else { ((v * amount).min(1.0).max(0.0) * 256.0) as i32 };
+            lrow[i] = q;
+            any |= q > 0;
+        }
+        if !any {
+            continue;
+        }
+        let base = y * w;
         for x in 0..w {
-            let fx = x as f32 * sx;
-            let x0 = (fx as usize).min(lw - 1);
-            let x1 = (x0 + 1).min(lw - 1);
-            let tx = fx - x0 as f32;
-            let i00 = (y0 * lw + x0) * 4;
-            let i01 = (y0 * lw + x1) * 4;
-            let i10 = (y1 * lw + x0) * 4;
-            let i11 = (y1 * lw + x1) * 4;
-            let k = if has_mask {
-                let m = s.mask[y * w + x] as f32 / 255.0;
-                amount * ((1.0 - m) + m * subj)
-            } else {
-                amount
-            };
-            if k <= 0.001 {
+            let kk = if has_mask { kt[s.mask[base + x] as usize] } else { 256 };
+            if kk == 0 {
                 continue;
             }
-            let pi = (y * w + x) * 4;
-            let mut lv = [0.0f32; 4];
-            for c in 0..4 {
-                let top = s.light[i00 + c] + (s.light[i01 + c] - s.light[i00 + c]) * tx;
-                let bot = s.light[i10 + c] + (s.light[i11 + c] - s.light[i10 + c]) * tx;
-                lv[c] = top + (bot - top) * ty;
+            let (a, b, tx) = cols[x];
+            let itx = 256 - tx;
+            let mut sh = (lrow[a + 3] * itx + lrow[b + 3] * tx) >> 8;
+            let mut l0 = (lrow[a] * itx + lrow[b] * tx) >> 8;
+            let mut l1 = (lrow[a + 1] * itx + lrow[b + 1] * tx) >> 8;
+            let mut l2 = (lrow[a + 2] * itx + lrow[b + 2] * tx) >> 8;
+            if kk != 256 {
+                sh = (sh * kk) >> 8;
+                l0 = (l0 * kk) >> 8;
+                l1 = (l1 * kk) >> 8;
+                l2 = (l2 * kk) >> 8;
             }
-            let dark = 1.0 - (lv[3] * k).min(0.9);
-            for c in 0..3 {
-                let v = s.a[pi + c] as f32 * dark;
-                let li = clamp01(lv[c] * k);
-                s.a[pi + c] = to_u8(v + (255.0 - v) * li);
+            if l0 + l1 + l2 + sh == 0 {
+                continue;
             }
+            let dark = 256 - sh;
+            let pi = (base + x) * 4;
+            let v0 = (s.a[pi] as i32 * dark) >> 8;
+            let v1 = (s.a[pi + 1] as i32 * dark) >> 8;
+            let v2 = (s.a[pi + 2] as i32 * dark) >> 8;
+            s.a[pi] = (v0 + (((255 - v0) * l0) >> 8)).min(255) as u8;
+            s.a[pi + 1] = (v1 + (((255 - v1) * l1) >> 8)).min(255) as u8;
+            s.a[pi + 2] = (v2 + (((255 - v2) * l2) >> 8)).min(255) as u8;
         }
     }
 }
-
-// ---------------------------------------------------------------- grading
 
 fn build_luts(p: &[f32]) -> [[u8; 256]; 3] {
     let mut luts = [[0u8; 256]; 3];
@@ -522,11 +627,12 @@ fn build_luts(p: &[f32]) -> [[u8; 256]; 3] {
     luts
 }
 
-fn grade(buf: &mut [u8], w: usize, h: usize, p: &[f32], frame: u32) {
+fn grade(buf: &mut [u8], w: usize, h: usize, p: &[f32], frame: u32, vigmap: &mut Vec<u8>, vigkey: &mut (usize, usize, u32), noise: &[i8]) {
     let luts = build_luts(p);
+    let mono = clamp01(p[MONO]);
     let sat = 1.0 + p[SATURATION];
     let vib = p[VIBRANCE];
-    let mono = clamp01(p[MONO]);
+    let satq = (sat * (1.0 - mono) * 256.0) as i32;
     let st = [p[SHADOW_TONE], p[SHADOW_TONE + 1], p[SHADOW_TONE + 2]];
     let ht = [p[HIGHLIGHT_TONE], p[HIGHLIGHT_TONE + 1], p[HIGHLIGHT_TONE + 2]];
     let toning = st.iter().chain(ht.iter()).any(|v| v.abs() > 0.001);
@@ -535,75 +641,124 @@ fn grade(buf: &mut [u8], w: usize, h: usize, p: &[f32], frame: u32) {
     let grain = p[GRAIN] * 30.0;
     let n = w * h;
 
-    if !color {
-        for i in 0..n {
-            let j = i * 4;
-            buf[j] = luts[0][buf[j] as usize];
-            buf[j + 1] = luts[1][buf[j + 1] as usize];
-            buf[j + 2] = luts[2][buf[j + 2] as usize];
+    // Tone offsets by luma, and film-grain weight by luma.
+    let mut offs = [[0i32; 256]; 3];
+    let mut gq = [0i32; 256];
+    for l in 0..256 {
+        let wl = l as f32 / 255.0;
+        let ws = (1.0 - wl) * (1.0 - wl) * 60.0;
+        let wh = wl * wl * 60.0;
+        for c in 0..3 {
+            offs[c][l] = (st[c] * ws + ht[c] * wh) as i32;
         }
-    } else {
-        for i in 0..n {
-            let j = i * 4;
-            let r = luts[0][buf[j] as usize] as f32;
-            let g = luts[1][buf[j + 1] as usize] as f32;
-            let b = luts[2][buf[j + 2] as usize] as f32;
-            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            let mut f = sat * (1.0 - mono);
-            if vib != 0.0 {
-                let mx = r.max(g).max(b);
-                let mn = r.min(g).min(b);
-                f *= 1.0 + vib * (1.0 - (mx - mn) / 255.0);
+        gq[l] = (grain * (1.0 - (wl - 0.5).abs()) * 16.0) as i32;
+    }
+    // Vignette multiplier per pixel (8.8 fixed), rebuilt only when it changes.
+    let use_vig = vig > 0.001;
+    if use_vig {
+        let key = (w, h, (vig * 1000.0) as u32);
+        if *vigkey != key || vigmap.len() != n {
+            vigmap.resize(n, 0);
+            for y in 0..h {
+                let dy = (y as f32 / h as f32 - 0.5) * 2.0;
+                for x in 0..w {
+                    let dx = (x as f32 / w as f32 - 0.5) * 2.0;
+                    let d = (dx * dx + dy * dy) * 0.5;
+                    vigmap[y * w + x] = ((1.0 - vig * smoothstep(0.15, 1.0, d)) * 255.0) as u8;
+                }
             }
-            let (mut r, mut g, mut b) = (l + (r - l) * f, l + (g - l) * f, l + (b - l) * f);
-            if toning {
-                let wl = l / 255.0;
-                let ws = (1.0 - wl) * (1.0 - wl) * 60.0;
-                let wh = wl * wl * 60.0;
-                r += st[0] * ws + ht[0] * wh;
-                g += st[1] * ws + ht[1] * wh;
-                b += st[2] * ws + ht[2] * wh;
-            }
-            buf[j] = to_u8(r);
-            buf[j + 1] = to_u8(g);
-            buf[j + 2] = to_u8(b);
+            *vigkey = key;
         }
     }
+    let use_grain = grain > 0.01;
+    let noff = (hash(frame, 7, 3) as usize) & 0xffff;
 
-    if vig > 0.001 || grain > 0.01 {
-        let colf: Vec<f32> = (0..w).map(|x| { let d = (x as f32 / w as f32 - 0.5) * 2.0; d * d }).collect();
-        for y in 0..h {
-            let dy = (y as f32 / h as f32 - 0.5) * 2.0;
-            let dy2 = dy * dy;
-            for x in 0..w {
-                let j = (y * w + x) * 4;
-                let mut k = 1.0;
-                if vig > 0.001 {
-                    let d = (colf[x] + dy2) * 0.5;
-                    k = 1.0 - vig * smoothstep(0.15, 1.0, d);
-                }
-                let mut add = 0.0;
-                if grain > 0.01 {
-                    let hv = (hash(x as u32, y as u32, frame) & 0xff) as f32 / 255.0 - 0.5;
-                    let l = buf[j + 1] as f32 / 255.0;
-                    add = hv * grain * (1.0 - (l - 0.5).abs());
-                }
-                for c in 0..3 {
-                    buf[j + c] = to_u8(buf[j + c] as f32 * k + add);
-                }
-            }
-        }
+    let ctx = GradeCtx { luts: &luts, offs: &offs, gq: &gq, vigmap, noise, noff, satq, vib };
+    // One specialised loop per combination, so the per-pixel branches disappear.
+    match (color, use_vig, use_grain) {
+        (false, false, false) => grade_loop::<false, false, false>(buf, &ctx),
+        (true, false, false) => grade_loop::<true, false, false>(buf, &ctx),
+        (false, true, false) => grade_loop::<false, true, false>(buf, &ctx),
+        (true, true, false) => grade_loop::<true, true, false>(buf, &ctx),
+        (false, false, true) => grade_loop::<false, false, true>(buf, &ctx),
+        (true, false, true) => grade_loop::<true, false, true>(buf, &ctx),
+        (false, true, true) => grade_loop::<false, true, true>(buf, &ctx),
+        (true, true, true) => grade_loop::<true, true, true>(buf, &ctx),
     }
 }
 
-fn sharpen(buf: &mut [u8], tmp: &mut [u8], w: usize, h: usize, amt: f32, line: &mut [u8]) {
-    tmp.copy_from_slice(buf);
-    box_blur(tmp, w, h, 1, line, false);
-    for i in 0..w * h {
-        let j = i * 4;
-        for c in 0..3 {
-            let v = buf[j + c] as f32;
-            buf[j + c] = to_u8(v + (v - tmp[j + c] as f32) * amt * 2.0);
+struct GradeCtx<'a> {
+    luts: &'a [[u8; 256]; 3],
+    offs: &'a [[i32; 256]; 3],
+    gq: &'a [i32; 256],
+    vigmap: &'a [u8],
+    noise: &'a [i8],
+    noff: usize,
+    satq: i32,
+    vib: f32,
+}
+
+#[inline(always)]
+fn grade_loop<const COLOR: bool, const VIG: bool, const GRAIN: bool>(buf: &mut [u8], c: &GradeCtx) {
+    let toning = COLOR; // tone offsets are zero when unused, so applying them is harmless
+    for (i, px) in buf.chunks_exact_mut(4).enumerate() {
+        let mut r = c.luts[0][px[0] as usize] as i32;
+        let mut g = c.luts[1][px[1] as usize] as i32;
+        let mut b = c.luts[2][px[2] as usize] as i32;
+        if COLOR {
+            let l = (54 * r + 183 * g + 19 * b) >> 8;
+            let mut f = c.satq;
+            if c.vib != 0.0 {
+                let mx = r.max(g).max(b);
+                let mn = r.min(g).min(b);
+                f = (c.satq as f32 * (1.0 + c.vib * (1.0 - (mx - mn) as f32 / 255.0))) as i32;
+            }
+            r = l + (((r - l) * f) >> 8);
+            g = l + (((g - l) * f) >> 8);
+            b = l + (((b - l) * f) >> 8);
+            if toning {
+                let li = (l & 255) as usize;
+                r += c.offs[0][li];
+                g += c.offs[1][li];
+                b += c.offs[2][li];
+            }
+        }
+        if VIG {
+            let k = c.vigmap[i] as i32 + 1;
+            r = (r * k) >> 8;
+            g = (g * k) >> 8;
+            b = (b * k) >> 8;
+        }
+        if GRAIN {
+            let nz = c.noise[(i + c.noff) & 0xffff] as i32;
+            let li = (g.clamp(0, 255)) as usize;
+            let add = (nz * c.gq[li]) >> 12;
+            r += add;
+            g += add;
+            b += add;
+        }
+        px[0] = r.clamp(0, 255) as u8;
+        px[1] = g.clamp(0, 255) as u8;
+        px[2] = b.clamp(0, 255) as u8;
+    }
+}
+
+fn sharpen(buf: &mut [u8], tmp: &mut [u8], w: usize, h: usize, amt: f32) {
+    if w < 3 || h < 3 {
+        return;
+    }
+    tmp[..w * h * 4].copy_from_slice(&buf[..w * h * 4]);
+    let k = (amt * 96.0) as i32;
+    let stride = w * 4;
+    for y in 1..h - 1 {
+        let row = y * stride;
+        for x in 1..w - 1 {
+            let j = row + x * 4;
+            for c in 0..3 {
+                let v = tmp[j + c] as i32;
+                let d = 4 * v - tmp[j + c - 4] as i32 - tmp[j + c + 4] as i32 - tmp[j + c - stride] as i32 - tmp[j + c + stride] as i32;
+                buf[j + c] = (v + ((k * d) >> 8)).clamp(0, 255) as u8;
+            }
         }
     }
 }
@@ -637,7 +792,7 @@ pub extern "C" fn process(layer: u32, time: f32, has_mask: u32) {
         match bg_mode {
             1 => {
                 s.tmp.copy_from_slice(&s.a);
-                blur(&mut s.tmp, w, h, p[BG_BLUR], &mut s.line);
+                blur(&mut s.tmp, w, h, p[BG_BLUR], &mut s.line, &mut s.small);
             }
             2 => {
                 let c = [to_u8(p[BG_COLOR] * 255.0), to_u8(p[BG_COLOR + 1] * 255.0), to_u8(p[BG_COLOR + 2] * 255.0)];
@@ -648,7 +803,7 @@ pub extern "C" fn process(layer: u32, time: f32, has_mask: u32) {
             3 => {
                 s.tmp.copy_from_slice(&s.bg);
                 if p[BG_BLUR] > 0.5 {
-                    blur(&mut s.tmp, w, h, p[BG_BLUR], &mut s.line);
+                    blur(&mut s.tmp, w, h, p[BG_BLUR], &mut s.line, &mut s.small);
                 }
             }
             4 => {
@@ -676,13 +831,13 @@ pub extern "C" fn process(layer: u32, time: f32, has_mask: u32) {
             }
             _ => s.tmp.copy_from_slice(&s.a),
         }
-        let dim = 1.0 - p[BG_DIM].max(-1.0).min(1.0) * 0.8;
+        let dim = ((1.0 - p[BG_DIM].max(-1.0).min(1.0) * 0.8) * 256.0) as i32;
         for i in 0..n {
-            let m = s.mask[i] as f32 / 255.0;
+            let m = s.mask[i] as i32;
             let j = i * 4;
             for c in 0..3 {
-                let bgv = (s.tmp[j + c] as f32 * dim).min(255.0);
-                s.a[j + c] = to_u8(bgv + (s.a[j + c] as f32 - bgv) * m);
+                let bgv = ((s.tmp[j + c] as i32 * dim) >> 8).min(255);
+                s.a[j + c] = (bgv + (((s.a[j + c] as i32 - bgv) * m) >> 8)).clamp(0, 255) as u8;
             }
         }
     } else if p[BG_DIM].abs() > 0.001 && has_mask {
@@ -698,15 +853,37 @@ pub extern "C" fn process(layer: u32, time: f32, has_mask: u32) {
 
     // 2. Lighting overlay.
     if p[LIGHT_MODE] as i32 != 0 && p[LIGHT_AMOUNT] > 0.001 {
-        build_light(s, &p, time);
+        // The light map is only rebuilt when its settings change, or ~15 times a second when it
+        // moves: it's smooth, so this is invisible and saves most of the work.
+        let mut key = [0.0f32; 16];
+        key[0] = p[LIGHT_MODE];
+        key[1] = p[LIGHT_POS];
+        key[2] = p[LIGHT_SOFT];
+        key[3] = p[LIGHT_SPEED];
+        key[4..7].copy_from_slice(&p[LIGHT_COLOR..LIGHT_COLOR + 3]);
+        key[7..10].copy_from_slice(&p[LIGHT_COLOR2..LIGHT_COLOR2 + 3]);
+        key[10] = s.w as f32;
+        let moving = p[LIGHT_SPEED] > 0.0;
+        let stale = !s.lvalid || s.lkey != key || (moving && ((time - s.ltime).abs() >= 0.066 || time < s.ltime));
+        if stale {
+            build_light(s, &p, if moving { time } else { 0.0 });
+            s.lkey = key;
+            s.ltime = time;
+            s.lvalid = true;
+        }
         apply_light(s, &p, has_mask);
     }
 
     // 3. Detail, grade, vignette, grain.
     if p[SHARPEN] > 0.01 {
-        sharpen(&mut s.a, &mut s.tmp, w, h, p[SHARPEN], &mut s.line);
+        sharpen(&mut s.a, &mut s.tmp, w, h, p[SHARPEN]);
     }
-    grade(&mut s.a, w, h, &p, s.frame);
+    let idle = p[..GAMMA].iter().enumerate().all(|(i, v)| v.abs() < 0.0005 || i == GAMMA)
+        && (p[GAMMA] < 0.05 || (p[GAMMA] - 1.0).abs() < 0.0005)
+        && (0..3).all(|c| p[GAIN + c] < 0.0005 || (p[GAIN + c] - 1.0).abs() < 0.0005);
+    if !idle {
+        grade(&mut s.a, w, h, &p, s.frame, &mut s.vigmap, &mut s.vigkey, &s.noise);
+    }
 
     if layer == 1 {
         std::mem::swap(&mut s.a, &mut s.b);
@@ -724,7 +901,7 @@ pub extern "C" fn copy_a_to_b() {
 #[no_mangle]
 pub extern "C" fn blur_a(r: f32) {
     let s = st();
-    blur(&mut s.a, s.w, s.h, r, &mut s.line);
+    blur(&mut s.a, s.w, s.h, r, &mut s.line, &mut s.small);
 }
 
 // ---------------------------------------------------------------- transitions
@@ -760,10 +937,13 @@ pub extern "C" fn transition(kind: u32, t: f32) {
     match kind {
         // Cross dissolve.
         1 => {
+            let e = (ease * 256.0) as i32;
             for i in 0..n {
                 let j = i * 4;
-                let bv = [s.b[j], s.b[j + 1], s.b[j + 2]];
-                mix(&mut s.a[j..j + 3], &bv, ease);
+                for c in 0..3 {
+                    let av = s.a[j + c] as i32;
+                    s.a[j + c] = (av + (((s.b[j + c] as i32 - av) * e) >> 8)) as u8;
+                }
             }
         }
         // Dip to black / white.
@@ -829,15 +1009,19 @@ pub extern "C" fn transition(kind: u32, t: f32) {
             let sa = 1.0 + ease * 0.8;
             let sb = 1.6 - ease * 0.6;
             let (cx, cy) = (wf * 0.5, hf * 0.5);
+            let axis = |n: usize, c: f32, z: f32| -> Vec<usize> { (0..n).map(|v| ((c + (v as f32 - c) / z).max(0.0) as usize).min(n - 1)).collect() };
+            let (xa, ya, xb, yb) = (axis(w, cx, sa), axis(h, cy, sa), axis(w, cx, sb), axis(h, cy, sb));
+            let e = (ease * 256.0) as i32;
             for y in 0..h {
+                let (ra, rb) = (ya[y] * w, yb[y] * w);
                 for x in 0..w {
-                    let dx = x as f32 - cx;
-                    let dy = y as f32 - cy;
-                    let pa = px(&s.tmp, w, h, (cx + dx / sa) as i32, (cy + dy / sa) as i32);
-                    let pb = px(&s.b, w, h, (cx + dx / sb) as i32, (cy + dy / sb) as i32);
+                    let ia = (ra + xa[x]) * 4;
+                    let ib = (rb + xb[x]) * 4;
                     let j = (y * w + x) * 4;
-                    s.a[j..j + 3].copy_from_slice(&pa[..3]);
-                    mix(&mut s.a[j..j + 3], &pb[..3], ease);
+                    for c in 0..3 {
+                        let av = s.tmp[ia + c] as i32;
+                        s.a[j + c] = (av + (((s.b[ib + c] as i32 - av) * e) >> 8)) as u8;
+                    }
                 }
             }
         }
@@ -863,8 +1047,8 @@ pub extern "C" fn transition(kind: u32, t: f32) {
         // Blur dissolve.
         12 => {
             let r = (t * std::f32::consts::PI).sin() * wf * 0.03;
-            blur(&mut s.a, w, h, r, &mut s.line);
-            blur(&mut s.b, w, h, r, &mut s.line);
+            blur(&mut s.a, w, h, r, &mut s.line, &mut s.small);
+            blur(&mut s.b, w, h, r, &mut s.line, &mut s.small);
             for i in 0..n {
                 let j = i * 4;
                 let bv = [s.b[j], s.b[j + 1], s.b[j + 2]];
@@ -924,18 +1108,32 @@ pub extern "C" fn transition(kind: u32, t: f32) {
         // Film burn.
         18 => {
             let f = (t * std::f32::consts::PI).sin();
+            let (gw, gh) = (w / 8 + 2, h / 8 + 2);
+            let mut grid = vec![0.0f32; gw * gh];
+            for gy in 0..gh {
+                for gx in 0..gw {
+                    grid[gy * gw + gx] = fbm((gx as f32 * 8.0 / wf) * 3.0 + t * 2.0, (gy as f32 * 8.0 / hf) * 3.0);
+                }
+            }
+            let e = (ease * 256.0) as i32;
             for y in 0..h {
+                let fy = y as f32 / 8.0;
+                let (gy, ty) = (fy as usize, fy - (fy as usize) as f32);
                 for x in 0..w {
                     let j = (y * w + x) * 4;
-                    let bv = [s.b[j], s.b[j + 1], s.b[j + 2]];
-                    mix(&mut s.a[j..j + 3], &bv, ease);
+                    let fx = x as f32 / 8.0;
+                    let (gx, tx) = (fx as usize, fx - (fx as usize) as f32);
+                    let n00 = grid[gy * gw + gx];
+                    let n10 = grid[gy * gw + gx + 1];
+                    let n01 = grid[(gy + 1) * gw + gx];
+                    let n11 = grid[(gy + 1) * gw + gx + 1];
+                    let nz = n00 + (n10 - n00) * tx + (n01 - n00) * ty + (n00 - n10 - n01 + n11) * tx * ty;
                     let u = x as f32 / wf;
-                    let v = y as f32 / hf;
-                    let nz = fbm(u * 3.0 + t * 2.0, v * 3.0);
                     let g = clamp01((nz + u * 0.6 - 0.5) * 2.0 * f + f * 0.3);
                     let tone = [255.0, 140.0, 40.0];
                     for c in 0..3 {
-                        let v0 = s.a[j + c] as f32;
+                        let av = s.a[j + c] as i32;
+                        let v0 = (av + (((s.b[j + c] as i32 - av) * e) >> 8)) as f32;
                         s.a[j + c] = to_u8(v0 + (tone[c] - v0 * 0.3) * g);
                     }
                 }

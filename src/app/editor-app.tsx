@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArrowLeft, ArrowRight, AudioWaveform, Blend, Captions, ChevronLeft, Copy, Crop, Download, Film, Gauge, ImagePlus,
   Lamp, LayoutTemplate, Mic, Move, Music, Smartphone, Video, WifiOff, Check, CloudDownload, Share, SquarePlus, Search, Bookmark, BookmarkCheck, FolderOpen, Palette, Pause, Play, Plus, Redo2, RectangleHorizontal, ScanFace, Scissors, Share2,
@@ -277,6 +277,27 @@ function Tool({ icon, label, onClick, danger }: { icon: ReactNode; label: string
 
 // ================================================================ editor
 
+type ClipApi = {
+  toggle: (id: string, on: boolean) => void;
+  drag: (e: React.PointerEvent, kind: string, id: string, orig: Record<string, number>) => void;
+};
+
+const ClipView = memo(function ClipView({ id, left, width, thumb, label, on, cin, cout, api }: {
+  id: string; left: number; width: number; thumb: string; label: string; on: boolean; cin: number; cout: number; api: { current: ClipApi };
+}) {
+  return (
+    <div className={"clip" + (on ? " sel" : "")} style={{ left, width, backgroundImage: thumb ? `url(${thumb})` : undefined }} onClick={() => api.current.toggle(id, on)}>
+      <span className="lbl">{label}</span>
+      {on && (
+        <>
+          <div className="handle l" onPointerDown={(e) => api.current.drag(e, "trimL", id, { in: cin, out: cout })} />
+          <div className="handle r" onPointerDown={(e) => api.current.drag(e, "trimR", id, { in: cin, out: cout })} />
+        </>
+      )}
+    </div>
+  );
+});
+
 type Sel = { type: "clip" | "text" | "music"; id: string } | null;
 type Drag = { kind: string; id: string; x0: number; y0: number; orig: Record<string, number> } | null;
 
@@ -329,6 +350,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
   const [safe, setSafe] = useState(false);
   const [fillerExtra, setFillerExtra] = useState(false);
   const voStart = useRef(0);
+  const clipApi = useRef<ClipApi>({ toggle: () => {}, drag: () => {} });
   const previewEl = useRef<HTMLAudioElement | null>(null);
   const [playingKey, setPlayingKey] = useState("");
   const [snd, setSnd] = useState<{ tab: "library" | "search" | "saved"; q: string; cat: "music" | "sound_effect"; hits: Hit[]; loading: boolean; getting: string }>({ tab: "library", q: "", cat: "music", hits: [], loading: false, getting: "" });
@@ -382,6 +404,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
   useEffect(() => {
     const pl = new Player();
     player.current = pl;
+    (window as unknown as { __lunyx?: Player }).__lunyx = pl; // handy for performance checks in the console
     pl.onState = setPlaying;
     pl.onStatus = setStatus;
     pl.onTime = (t) => {
@@ -947,6 +970,11 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
   // ---------------------------------------------------------------- panels
 
   const L = selClip?.look;
+  // Stable handle for the memoised timeline clips (they only re-render when their own numbers change).
+  clipApi.current = {
+    toggle: (id, on) => { setSel(on ? null : { type: "clip", id }); if (on) setPanel(null); },
+    drag: (e, kind, id, orig) => startDrag(e, kind, id, orig),
+  };
   const panels: Record<string, () => ReactNode> = {
     filters: () => L && (
       <Sheet title="Filters" onClose={() => setPanel(null)}>
@@ -1368,22 +1396,11 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
               {ticks.map((t) => <span key={t} style={{ left: t * pps }}>{P.fmt(t).replace(/\.\d$/, "")}</span>)}
             </div>
             <div className="track" style={{ top: 24, height: 52, left: half }}>
-              {p.clips.map((c, i) => {
-                const on = selClip?.id === c.id;
-                const a = assets[c.assetId];
-                return (
-                  <div key={c.id} className={"clip" + (on ? " sel" : "")} style={{ left: lay.starts[i] * pps, width: P.clipLen(c) * pps - 2, backgroundImage: a?.thumb ? `url(${a.thumb})` : undefined }}
-                    onClick={() => { setSel(on ? null : { type: "clip", id: c.id }); if (on) setPanel(null); }}>
-                    <span className="lbl">{P.fmt(P.clipLen(c))}{c.speed !== 1 ? ` · ${c.speed}×` : ""}{P.lookActive(c.look) ? " · fx" : ""}</span>
-                    {on && (
-                      <>
-                        <div className="handle l" onPointerDown={(e) => startDrag(e, "trimL", c.id, { in: c.in, out: c.out })} />
-                        <div className="handle r" onPointerDown={(e) => startDrag(e, "trimR", c.id, { in: c.in, out: c.out })} />
-                      </>
-                    )}
-                  </div>
-                );
-              })}
+              {p.clips.map((c, i) => (
+                <ClipView key={c.id} id={c.id} left={lay.starts[i] * pps} width={P.clipLen(c) * pps - 2} thumb={assets[c.assetId]?.thumb ?? ""}
+                  label={`${P.fmt(P.clipLen(c))}${c.speed !== 1 ? ` · ${c.speed}×` : ""}${P.lookActive(c.look) ? " · fx" : ""}`}
+                  on={selClip?.id === c.id} cin={c.in} cout={c.out} api={clipApi} />
+              ))}
               {p.clips.slice(0, -1).map((c, i) => (
                 <button key={c.id + "t"} className={"tbtn" + (c.transition.kind ? " on" : "")} aria-label="Transition" style={{ left: (lay.starts[i + 1] + lay.trans[i] / 2) * pps }}
                   onClick={(e) => { e.stopPropagation(); setSel({ type: "clip", id: c.id }); setPanel("transition"); }}>

@@ -1,7 +1,7 @@
 // Lunyx offline worker. Keeps the app, effects engine, fonts and AI libraries
 // on the device so the editor opens and works with no connection.
-const CACHE = "lunyx-v2";
-const SHELL = ["/", "/cut/fx.wasm", "/cut/manifest.webmanifest", "/cut/icon-192.png", "/cut/icon-180.png", "/cut/logo.svg", "/asr-worker.js"];
+const CACHE = "lunyx-v3";
+const SHELL = ["/", "/cut/fx.wasm", "/cut/manifest.webmanifest", "/cut/icon-192.png", "/cut/icon-180.png", "/cut/logo.svg", "/asr-worker.js", "/seg-worker.js"];
 const CDN = ["cdn.jsdelivr.net", "fonts.googleapis.com", "fonts.gstatic.com", "storage.googleapis.com"];
 
 self.addEventListener("install", (event) => {
@@ -47,7 +47,7 @@ self.addEventListener("fetch", (event) => {
   if (url.origin === self.location.origin) {
     if (url.pathname.startsWith("/_next/static/")) event.respondWith(cacheFirst(req));
     else if (req.mode === "navigate") event.respondWith(networkFirst(req, "/"));
-    else if (url.pathname.startsWith("/cut/") || url.pathname === "/asr-worker.js") event.respondWith(networkFirst(req));
+    else if (url.pathname.startsWith("/cut/") || url.pathname === "/asr-worker.js" || url.pathname === "/seg-worker.js") event.respondWith(networkFirst(req));
     return;
   }
   if (CDN.includes(url.hostname)) event.respondWith(cacheFirst(req));
