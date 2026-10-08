@@ -58,8 +58,8 @@ export async function storageInfo() {
 
 /** Removes media no project references any more. */
 export async function collectGarbage() {
-  const [projects, ids] = await Promise.all([db.projects(), db.assetIds()]);
-  const used = new Set<string>();
+  const [projects, ids, lib] = await Promise.all([db.projects(), db.assetIds(), db.get<{ id: string }[]>("library")]);
+  const used = new Set<string>((lib ?? []).map((x) => x.id));
   for (const p of projects) {
     p.clips.forEach((c) => { used.add(c.assetId); if (c.look.bg.imageId) used.add(c.look.bg.imageId); });
     p.music.forEach((m) => used.add(m.assetId));

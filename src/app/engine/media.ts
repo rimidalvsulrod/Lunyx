@@ -25,10 +25,12 @@ export function assetUrl(a: Asset) {
 
 export const cachedAsset = (id: string) => assets.get(id);
 
-function waitFor(el: HTMLMediaElement, ev: string) {
-  return new Promise<void>((resolve, reject) => {
-    el.addEventListener(ev, () => resolve(), { once: true });
-    el.addEventListener("error", () => reject(new Error("Unsupported media")), { once: true });
+/** Resolves on `ev`, rejects on error, and never hangs (iOS often skips events). */
+function waitFor(el: HTMLMediaElement, ev: string, ms = 8000) {
+  return new Promise<boolean>((resolve, reject) => {
+    const t = setTimeout(() => resolve(false), ms);
+    el.addEventListener(ev, () => { clearTimeout(t); resolve(true); }, { once: true });
+    el.addEventListener("error", () => { clearTimeout(t); reject(new Error("This format can't be played on this device")); }, { once: true });
   });
 }
 
@@ -41,10 +43,55 @@ async function thumbFrom(src: CanvasImageSource, w: number, h: number) {
   return new Promise<Blob | undefined>((r) => c.toBlob((b) => r(b ?? undefined), "image/jpeg", 0.7));
 }
 
-/** Reads an imported file, captures a thumbnail and stores it in IndexedDB. */
-export async function importFile(file: File): Promise<Asset> {
-  const kind: AssetKind = file.type.startsWith("image") ? "image" : file.type.startsWith("audio") ? "audio" : "video";
-  const a: Asset = { id: uid(), name: file.name, kind, blob: file, duration: 3, w: 0, h: 0, added: Date.now() };
+const VIDEO_EXT = /\.(mp4|m4v|mov|qt|webm|mkv|avi|3gp|hevc)$/i;
+const AUDIO_EXT = /\.(mp3|m4a|aac|wav|aif|aiff|caf|ogg|oga|opus|flac|weba)$/i;
+const IMAGE_EXT = /\.(jpe?g|png|gif|webp|heic|heif|avif|bmp)$/i;
+
+export function kindOf(file: File): AssetKind {
+  const t = file.type;
+  if (t.startsWith("image") || (!t && IMAGE_EXT.test(file.name))) return "image";
+  if (t.startsWith("audio") || (!t && AUDIO_EXT.test(file.name))) return "audio";
+  if (t.startsWith("video") || VIDEO_EXT.test(file.name)) return "video";
+  return AUDIO_EXT.test(file.name) ? "audio" : IMAGE_EXT.test(file.name) ? "image" : "video";
+}
+
+/** Reads metadata + a thumbnail from a video without needing it to fully load. */
+async function probeVideo(url: string, a: Asset) {
+  const v = document.createElement("video");
+  v.muted = true;
+  v.playsInline = true;
+  v.setAttribute("playsinline", "");
+  v.preload = "metadata";
+  // iOS only decodes videos that are in the document.
+  v.style.cssText = "position:fixed;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none";
+  document.body.appendChild(v);
+  try {
+    v.src = url;
+    v.load();
+    if (!(await waitFor(v, "loadedmetadata", 15000)) && !v.duration) throw new Error("Couldn't read this video");
+    a.duration = v.duration;
+    a.w = v.videoWidth;
+    a.h = v.videoHeight;
+    // Thumbnail is best effort: seek a little in, nudge iOS with a muted play if needed.
+    v.currentTime = Math.min(0.15, (a.duration || 1) / 2);
+    await waitFor(v, "seeked", 3000).catch(() => false);
+    if (v.readyState < 2) {
+      await v.play().catch(() => {});
+      await waitFor(v, "timeupdate", 2000).catch(() => false);
+      v.pause();
+    }
+    if (v.readyState >= 2 && v.videoWidth) a.thumb = await thumbFrom(v, v.videoWidth, v.videoHeight);
+  } finally {
+    v.removeAttribute("src");
+    v.load();
+    v.remove();
+  }
+}
+
+/** Reads an imported file, captures a thumbnail and stores it on the device (IndexedDB). */
+export async function importFile(file: File, extra?: Partial<Asset>): Promise<Asset> {
+  const kind = kindOf(file);
+  const a: Asset = { id: uid(), name: file.name, kind, blob: file, duration: 3, w: 0, h: 0, added: Date.now(), ...extra };
   const url = URL.createObjectURL(file);
   try {
     if (kind === "image") {
@@ -59,29 +106,21 @@ export async function importFile(file: File): Promise<Asset> {
       const el = new Audio();
       el.preload = "metadata";
       el.src = url;
-      await waitFor(el, "loadedmetadata");
+      if (!(await waitFor(el, "loadedmetadata", 15000))) throw new Error("Couldn't read this audio file");
       a.duration = el.duration;
     } else {
-      const v = document.createElement("video");
-      v.muted = true;
-      v.playsInline = true;
-      v.preload = "auto";
-      v.src = url;
-      await waitFor(v, "loadeddata");
-      a.duration = v.duration;
-      a.w = v.videoWidth;
-      a.h = v.videoHeight;
-      v.currentTime = Math.min(0.2, a.duration / 2);
-      await waitFor(v, "seeked");
-      a.thumb = await thumbFrom(v, a.w, a.h);
-      v.removeAttribute("src");
-      v.load();
+      await probeVideo(url, a);
     }
   } finally {
     URL.revokeObjectURL(url);
   }
   if (!isFinite(a.duration) || a.duration <= 0) a.duration = 3;
-  await db.saveAsset(a);
+  try {
+    await db.saveAsset(a);
+  } catch (e) {
+    const name = (e as DOMException)?.name;
+    throw new Error(name === "QuotaExceededError" ? "Not enough storage on this device for this file" : "Couldn't save this file on the device");
+  }
   assets.set(a.id, a);
   return a;
 }

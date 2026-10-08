@@ -250,7 +250,8 @@ export function layout(p: Project) {
     t += clipLen(c) - d;
   });
   const videoEnd = t + (trans.length ? trans[trans.length - 1] : 0);
-  const end = Math.max(videoEnd, ...p.texts.map((x) => x.end), ...p.music.map((m) => m.start + (m.out - m.in)), 0);
+  // With clips, the video sets the length (longer music is cut at the end, like any editor).
+  const end = p.clips.length ? videoEnd : Math.max(...p.texts.map((x) => x.end), ...p.music.map((m) => m.start + (m.out - m.in)), 0);
   return { starts, trans, videoEnd, end };
 }
 
@@ -261,3 +262,6 @@ export const fmt = (t: number) => {
   const f = Math.floor((t % 1) * 10);
   return `${m}:${String(s).padStart(2, "0")}.${f}`;
 };
+
+/** Short lengths as "0.9s", longer as "2:03". */
+export const fmtLen = (t: number) => (t < 10 ? `${t.toFixed(1)}s` : fmt(t).replace(/\.\d$/, ""));

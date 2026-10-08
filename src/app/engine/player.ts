@@ -67,6 +67,7 @@ export class Player {
   private fontWait = new Set<string>();
   private hadMask = false;
   private endResolve: (() => void) | null = null;
+  private blessed = new WeakSet<HTMLMediaElement>();
 
   canvas = document.createElement("canvas");
   private host = document.createElement("div");
@@ -89,7 +90,6 @@ export class Player {
     el.playsInline = true;
     el.setAttribute("playsinline", "");
     el.preload = "auto";
-    el.crossOrigin = "anonymous";
     this.host.appendChild(el);
     const d: Deck = { el, assetId: null, img: null, pending: null, audioKey: "" };
     el.addEventListener("seeked", () => {
@@ -199,8 +199,11 @@ export class Player {
     this.ensureAudio();
     const els = [...this.decks.map((d) => d.el), ...[...this.music.values()].map((m) => m.el)];
     for (const el of els) {
-      if (!el.src || !el.paused) continue;
-      el.play().then(() => { if (!this.playing) el.pause(); }).catch(() => {});
+      if (!el.src || !el.paused || this.blessed.has(el)) continue;
+      this.blessed.add(el);
+      el.play()
+        .then(() => { if (!this.playing) { el.pause(); this.seek(this.time); } })
+        .catch(() => this.blessed.delete(el));
     }
   }
 

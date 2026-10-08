@@ -3,7 +3,6 @@
 
 const VISION = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/";
 const SEG_MODEL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
-const TRANSFORMERS = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/transformers.min.js";
 
 // Bypass the bundler: these are plain ES modules from the CDN.
 const dynImport = new Function("u", "return import(u)") as (u: string) => Promise<Record<string, unknown>>;
@@ -81,32 +80,6 @@ export class PersonSegmenter {
   }
 }
 
-const WORKER = `
-let asr = null, cur = "";
-self.onmessage = async (e) => {
-  const { id, model, pcm, multilingual } = e.data;
-  try {
-    const T = await import("${TRANSFORMERS}");
-    T.env.allowLocalModels = false;
-    if (!asr || cur !== model) {
-      asr = await T.pipeline("automatic-speech-recognition", model, {
-        dtype: "q8", device: "wasm",
-        progress_callback: (p) => { if (p.status === "progress") self.postMessage({ id, progress: p.progress, file: p.file }); },
-      });
-      cur = model;
-    }
-    self.postMessage({ id, stage: "transcribing" });
-    const base = { chunk_length_s: 30, stride_length_s: 5 };
-    if (multilingual) base.task = "transcribe";
-    let out;
-    try { out = await asr(pcm, { ...base, return_timestamps: "word" }); }
-    catch { out = await asr(pcm, { ...base, return_timestamps: true }); }
-    self.postMessage({ id, result: out.chunks || [{ text: out.text, timestamp: [0, pcm.length / 16000] }] });
-  } catch (err) {
-    self.postMessage({ id, error: String(err && err.message || err) });
-  }
-};`;
-
 let worker: Worker | null = null;
 let seq = 0;
 
@@ -118,9 +91,10 @@ export const ASR_MODELS = [
 
 export type AsrChunk = { text: string; timestamp: [number, number | null] };
 
-/** Transcribes 16 kHz mono PCM in a worker. `onStatus` gets download / progress text. */
+/** Transcribes 16 kHz mono PCM in a worker. `onStatus` gets download / progress text.
+ *  With an empty `pcm` it only downloads + caches the model (offline pack). */
 export function transcribe(pcm: Float32Array, modelId: string, onStatus: (s: string) => void): Promise<AsrChunk[]> {
-  if (!worker) worker = new Worker(URL.createObjectURL(new Blob([WORKER], { type: "text/javascript" })), { type: "module" });
+  if (!worker) worker = new Worker("/asr-worker.js", { type: "module" });
   const id = ++seq;
   const model = ASR_MODELS.find((m) => m.id === modelId) ?? ASR_MODELS[0];
   return new Promise((resolve, reject) => {
@@ -137,6 +111,6 @@ export function transcribe(pcm: Float32Array, modelId: string, onStatus: (s: str
       }
     };
     w.addEventListener("message", onMsg);
-    w.postMessage({ id, model: model.id, multilingual: model.multi, pcm });
+    w.postMessage({ id, model: model.id, multilingual: model.multi, pcm, warm: !pcm.length });
   });
 }

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ArrowLeft, ArrowRight, AudioWaveform, Blend, Captions, ChevronLeft, Copy, Crop, Download, Film, Gauge, ImagePlus,
-  Lamp, LayoutTemplate, Mic, Move, Music, Smartphone, Video, Palette, Pause, Play, Plus, Redo2, RectangleHorizontal, ScanFace, Scissors, Share2,
+  Lamp, LayoutTemplate, Mic, Move, Music, Smartphone, Video, WifiOff, Check, CloudDownload, Share, SquarePlus, Search, Bookmark, BookmarkCheck, FolderOpen, Palette, Pause, Play, Plus, Redo2, RectangleHorizontal, ScanFace, Scissors, Share2,
   SlidersHorizontal, Sparkles, Trash2, Type, Undo2, Volume2, WandSparkles, X, ZoomIn, ZoomOut,
 } from "lucide-react";
 import { RibbonHero } from "@/components/ribbon/RibbonBackground";
@@ -14,6 +14,9 @@ import { getFx } from "./engine/fx";
 import { ASR_MODELS, transcribe, type AsrChunk } from "./engine/ai";
 import * as P from "./engine/presets";
 import { Recorder } from "./recorder";
+import { canPromptInstall, downloadOfflinePack, isIOS, isStandalone, offlineStatus, promptInstall, setupOffline, watchInstall, type OfflinePack } from "./engine/offline";
+import { downloadHit, library, licenseName, searchSounds, type Hit, type LibItem } from "./engine/sounds";
+import { renderSfx, SFX } from "./engine/sfx";
 import type { Asset, Clip, Look, Project, TextItem, TextStyle, Word } from "./engine/types";
 
 const ACCENT = "#2997ff";
@@ -26,7 +29,8 @@ export default function EditorApp() {
   useEffect(() => {
     const fromHash = location.hash.slice(1);
     if (fromHash) Promise.resolve().then(() => setOpenId(fromHash));
-    if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+    if (document.readyState === "complete") setupOffline();
+    else window.addEventListener("load", () => setupOffline(), { once: true });
     if (!document.getElementById("ed-fonts")) {
       const l = document.createElement("link");
       l.id = "ed-fonts";
@@ -53,7 +57,10 @@ export default function EditorApp() {
 function Home({ onOpen }: { onOpen: (id: string) => void }) {
   const [rows, setRows] = useState<{ p: Project; thumb: string; dur: number }[] | null>(null);
   const [info, setInfo] = useState({ used: 0, quota: 0 });
-  const [tip, setTip] = useState(false);
+  const [env, setEnv] = useState({ standalone: false, ios: false, canInstall: false, online: true });
+  const [pack, setPack] = useState<OfflinePack | null>(null);
+  const [dl, setDl] = useState<{ f: number; label: string } | null>(null);
+  const [steps, setSteps] = useState(false);
 
   const refresh = useCallback(async () => {
     const ps = (await db.projects()).sort((a, b) => b.updated - a.updated);
@@ -68,10 +75,13 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
   }, []);
 
   useEffect(() => {
-    Promise.resolve().then(refresh);
-    const nav = navigator as Navigator & { standalone?: boolean };
-    const ios = /iPhone|iPad|iPod/.test(navigator.userAgent);
-    if (ios && !nav.standalone) Promise.resolve().then(() => setTip(true));
+    const upd = () => setEnv({ standalone: isStandalone(), ios: isIOS(), canInstall: canPromptInstall(), online: navigator.onLine });
+    Promise.resolve().then(() => { refresh(); upd(); });
+    offlineStatus().then((x) => setPack(x ?? null));
+    const off = watchInstall(upd);
+    window.addEventListener("online", upd);
+    window.addEventListener("offline", upd);
+    return () => { off(); window.removeEventListener("online", upd); window.removeEventListener("offline", upd); };
   }, [refresh]);
 
   const create = async () => {
@@ -87,6 +97,25 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
     refresh();
   };
 
+  const install = async () => {
+    if (canPromptInstall()) {
+      await promptInstall();
+      setEnv((e) => ({ ...e, canInstall: false, standalone: isStandalone() }));
+    } else setSteps(true);
+  };
+
+  const getPack = async () => {
+    setDl({ f: 0, label: "Starting" });
+    try {
+      setPack(await downloadOfflinePack(ASR_MODELS[0].id, (f, label) => setDl({ f, label })));
+    } catch (e) {
+      alert("Download stopped: " + ((e as Error).message || "check your connection"));
+    } finally {
+      setDl(null);
+      refresh();
+    }
+  };
+
   const mb = (b: number) => (b / 1e6 < 1000 ? `${Math.round(b / 1e6)} MB` : `${(b / 1e9).toFixed(1)} GB`);
 
   return (
@@ -94,29 +123,52 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
       <div className="hero">
         <RibbonHero accent={ACCENT} />
         <h1 className="brand">
+          {/* Plain img: tiny static SVG, no optimisation needed. */}
           <img src="/cut/logo.svg" alt="" width={36} height={36} />
           Lunyx
+          {!env.online && <span className="offpill"><WifiOff size={12} /> Offline</span>}
         </h1>
         <p>Cut, grade, caption and light your videos. Everything stays on this device.</p>
         <button className="newbtn" onClick={create}>
           <Plus size={22} /> New project
         </button>
       </div>
-      {tip && (
-        <div className="tip">
-          <b>Install the app:</b> tap the Share button in Safari, then <b>Add to Home Screen</b>. It opens full screen and works offline.
+
+      <div className="getapp">
+        <div className="garow">
+          <Smartphone size={20} />
+          <div className="gatext">
+            <b>{env.standalone ? "Installed" : "Get the app"}</b>
+            <small>{env.standalone ? "Running from your Home Screen" : "Full screen, own icon, opens offline"}</small>
+          </div>
+          {env.standalone ? <Check size={20} color="#30d158" /> : <button className="pill" onClick={install}>Install</button>}
         </div>
-      )}
+        <div className="garow">
+          <CloudDownload size={20} />
+          <div className="gatext">
+            <b>{pack ? "Works offline" : "Offline mode"}</b>
+            <small>{dl ? `${dl.label} · ${Math.round(dl.f * 100)}%` : pack ? `Downloaded ${new Date(pack.at).toLocaleDateString()}` : "Fonts, cutout + captions AI · about 45 MB"}</small>
+            {dl && <div className="bar"><i style={{ width: `${dl.f * 100}%` }} /></div>}
+          </div>
+          {pack && !dl ? (
+            <button className="pill gray" disabled={!env.online} onClick={getPack}>Update</button>
+          ) : (
+            <button className="pill" disabled={!!dl || !env.online} onClick={getPack}>{dl ? "…" : "Download"}</button>
+          )}
+        </div>
+      </div>
+
       <div className="sectionh">
         <span>projects · {rows?.length ?? 0}</span>
         {info.quota > 0 && <span>{mb(info.used)} of {mb(info.quota)}</span>}
       </div>
+      {rows && !rows.length && <p className="empty">No projects yet. Tap New project and add a video.</p>}
       <div className="plist">
         {rows?.map(({ p, thumb, dur }) => (
           <div key={p.id} className="pcard" onClick={() => onOpen(p.id)}>
             <div className="th" style={{ backgroundImage: thumb ? `url(${thumb})` : undefined }} />
             <div className="meta">
-              {p.name}
+              <span className="pname">{p.name}</span>
               <small>
                 {P.fmt(dur)} · {p.aspect} · {new Date(p.updated).toLocaleDateString()}
               </small>
@@ -127,6 +179,29 @@ function Home({ onOpen }: { onOpen: (id: string) => void }) {
           </div>
         ))}
       </div>
+
+      {steps && (
+        <div className="modal" onClick={() => setSteps(false)}>
+          <div className="card" onClick={(e) => e.stopPropagation()}>
+            <img src="/cut/icon-192.png" alt="" width={64} height={64} style={{ borderRadius: 14 }} />
+            <h3 style={{ margin: "12px 0 4px" }}>Add Lunyx to your Home Screen</h3>
+            {env.ios ? (
+              <ol className="steps">
+                <li>Tap <Share size={16} style={{ verticalAlign: -3 }} /> <b>Share</b> in Safari&apos;s toolbar</li>
+                <li>Scroll down, tap <SquarePlus size={16} style={{ verticalAlign: -3 }} /> <b>Add to Home Screen</b></li>
+                <li>Open Lunyx from your Home Screen and tap <b>Download</b> under Offline mode</li>
+              </ol>
+            ) : (
+              <ol className="steps">
+                <li>Open your browser menu (⋮ or Share)</li>
+                <li>Choose <b>Install app</b> or <b>Add to Home Screen</b></li>
+              </ol>
+            )}
+            <p className="note">On iPhone the installed app keeps its own storage, so start your projects inside it.</p>
+            <button className="btn" onClick={() => setSteps(false)}>Got it</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -254,6 +329,10 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
   const [safe, setSafe] = useState(false);
   const [fillerExtra, setFillerExtra] = useState(false);
   const voStart = useRef(0);
+  const previewEl = useRef<HTMLAudioElement | null>(null);
+  const [playingKey, setPlayingKey] = useState("");
+  const [snd, setSnd] = useState<{ tab: "library" | "search" | "saved"; q: string; cat: "music" | "sound_effect"; hits: Hit[]; loading: boolean; getting: string }>({ tab: "library", q: "", cat: "music", hits: [], loading: false, getting: "" });
+  const [lib, setLib] = useState<LibItem[]>([]);
 
   // ---------------------------------------------------------------- project state
 
@@ -262,7 +341,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
     setP(next);
     player.current?.setProject(next);
     clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => db.saveProject(next), 350);
+    saveTimer.current = window.setTimeout(() => db.saveProject(next), 150);
   }, []);
 
   const commit = useCallback((fn: (d: Project) => void, merge?: string) => {
@@ -329,8 +408,15 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
       if ((e.metaKey || e.ctrlKey) && e.key === "z") { e.preventDefault(); if (e.shiftKey) redo(); else undo(); }
     };
     window.addEventListener("keydown", key);
+    // iOS can kill a backgrounded app at any moment: save the moment we're hidden.
+    const save = () => { if (pRef.current) { clearTimeout(saveTimer.current); db.saveProject(pRef.current); } };
+    const flush = () => { if (document.visibilityState === "hidden") save(); };
+    document.addEventListener("visibilitychange", flush);
+    window.addEventListener("pagehide", save);
     return () => {
       window.removeEventListener("keydown", key);
+      document.removeEventListener("visibilitychange", flush);
+      window.removeEventListener("pagehide", save);
       pl.destroy();
       if (pRef.current) db.saveProject(pRef.current);
     };
@@ -406,7 +492,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
     const added: Asset[] = [];
     for (const f of Array.from(files)) {
       setStatus(`Importing ${f.name}…`);
-      try { added.push(await importFile(f)); } catch { flash(`Can't open ${f.name}`); }
+      try { added.push(await importFile(f)); } catch (e) { flash(`${f.name}: ${(e as Error).message || "can't open"}`); }
     }
     setStatus("");
     setBusy(false);
@@ -416,26 +502,93 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
       d.clips.splice(at, 0, ...added.map((a) => P.newClip(a.id, a.kind === "image" ? 3 : a.duration)));
       if (d.clips.length === added.length && added[0].w && added[0].h) {
         const r = added[0].w / added[0].h;
-        d.aspect = r > 1.5 ? "16:9" : r > 1.1 ? "4:5" : r > 0.9 ? "1:1" : "9:16";
-        if (r > 0.9 && r < 1.1) d.aspect = "1:1";
+        d.aspect = r >= 1.2 ? "16:9" : r > 0.9 ? "1:1" : r > 0.7 ? "4:5" : "9:16";
       }
     });
   };
 
-  const addMusic = async (files: FileList | null) => {
+  const addMusic = async (files: File[]) => {
     const f = files?.[0];
     if (!f) return;
     setStatus("Importing audio…");
     try {
       const a = await importFile(f);
-      commit((d) => d.music.push({ id: P.uid(), assetId: a.id, start: T(), in: 0, out: a.duration, volume: 0.6, fadeIn: 0.5, fadeOut: 1 }));
-      flash("Music added");
-    } catch {
-      flash("Can't open that file");
+      await library.add({ id: a.id, name: a.name.replace(/\.[^.]+$/, ""), kind: "music", duration: a.duration, added: Date.now() });
+      addSound(a.id, a.duration, "music", a.name);
+      setStatus("");
+    } catch (e) {
+      flash((e as Error).message || "Can't open that file");
     }
   };
 
-  const setBgImage = async (files: FileList | null) => {
+  /** Puts a stored sound on the audio track at the playhead. */
+  const addSound = (assetId: string, duration: number, kind: "music" | "sfx", name: string) => {
+    setAssets((s) => ({ ...s, [assetId]: { kind: "audio", duration, name, thumb: "" } }));
+    commit((d) => d.music.push({
+      id: P.uid(), assetId, start: T(), in: 0, out: duration,
+      volume: kind === "sfx" ? 1 : 0.6, fadeIn: kind === "sfx" ? 0 : 0.5, fadeOut: kind === "sfx" ? 0 : 1, vo: kind === "sfx",
+    }));
+    flash(`${name} added at ${P.fmt(T())}`);
+  };
+
+  const preview = (src: string, key: string) => {
+    const el = (previewEl.current ??= new Audio());
+    if (playingKey === key && !el.paused) { el.pause(); setPlayingKey(""); return; }
+    el.src = src;
+    el.onended = () => setPlayingKey("");
+    el.play().then(() => setPlayingKey(key)).catch(() => flash("Can't play this preview"));
+  };
+  const stopPreview = () => { previewEl.current?.pause(); setPlayingKey(""); };
+
+  const addSfx = async (id: string) => {
+    const fx = SFX.find((x) => x.id === id)!;
+    setBusy(true);
+    try {
+      const key = `sfx:${id}`;
+      let aid = await db.get<string>(key);
+      let a = aid ? await loadAsset(aid) : undefined;
+      if (!a) {
+        a = await importFile(new File([await renderSfx(id)], `${fx.name}.wav`, { type: "audio/wav" }));
+        aid = a.id;
+        await db.set(key, aid);
+        await library.add({ id: a.id, name: fx.name, kind: "sfx", duration: a.duration, added: Date.now() });
+      }
+      addSound(a.id, a.duration, "sfx", fx.name);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runSearch = async () => {
+    if (!snd.q.trim()) return;
+    if (!navigator.onLine) return flash("Search needs a connection. Saved sounds work offline.");
+    setSnd((x) => ({ ...x, loading: true, hits: [] }));
+    try {
+      const hits = await searchSounds(snd.q.trim(), snd.cat);
+      setSnd((x) => ({ ...x, hits, loading: false }));
+      if (!hits.length) flash("No results");
+    } catch (e) {
+      setSnd((x) => ({ ...x, loading: false }));
+      flash((e as Error).message);
+    }
+  };
+
+  const addHit = async (h: Hit) => {
+    setSnd((x) => ({ ...x, getting: h.id }));
+    try {
+      const a = await importFile(await downloadHit(h));
+      const kind = snd.cat === "music" ? "music" : "sfx";
+      await library.add({ id: a.id, name: h.title, kind, duration: a.duration, credit: h.creator, license: h.license, added: Date.now() });
+      setLib(await library.list());
+      addSound(a.id, a.duration, kind, h.title);
+    } catch (e) {
+      flash((e as Error).message || "Download failed");
+    } finally {
+      setSnd((x) => ({ ...x, getting: "" }));
+    }
+  };
+
+  const setBgImage = async (files: File[]) => {
     const f = files?.[0];
     if (!f) return;
     const a = await importFile(f);
@@ -931,7 +1084,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
     ),
     music: () => (
       <Sheet title="Music" onClose={() => setPanel(null)}>
-        <button className="btn" onClick={() => musicRef.current?.click()}>Add music or sound at playhead</button>
+        <button className="btn" onClick={() => setPanel("sounds")}>Add music or sounds</button>
         <Toggle label="Lower music when someone talks" on={p.duck} onChange={(v) => commit((d) => (d.duck = v))} />
         {selMusic && (
           <>
@@ -940,6 +1093,64 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
             <Slider label="Fade in" value={selMusic.fadeIn} min={0} max={5} show={(v) => v.toFixed(1) + "s"} onChange={(v) => commit((d) => { const m = d.music.find((x) => x.id === selMusic.id); if (m) m.fadeIn = v; }, "mfi")} />
             <Slider label="Fade out" value={selMusic.fadeOut} min={0} max={5} show={(v) => v.toFixed(1) + "s"} onChange={(v) => commit((d) => { const m = d.music.find((x) => x.id === selMusic.id); if (m) m.fadeOut = v; }, "mfo")} />
             <button className="btn gray" onClick={() => commit((d) => { const m = d.music.find((x) => x.id === selMusic.id); if (m) m.out = Math.min(m.out, m.in + Math.max(0.5, P.layout(d).videoEnd - m.start)); })}>Trim to video length</button>
+          </>
+        )}
+      </Sheet>
+    ),
+    sounds: () => (
+      <Sheet title="Sounds" onClose={() => { stopPreview(); setPanel(null); }}>
+        <Chips items={[{ k: "library", label: "Effects" }, { k: "search", label: "Search" }, { k: "saved", label: "Saved" }] as { k: typeof snd.tab; label: string }[]} value={snd.tab}
+          onChange={(v) => { setSnd({ ...snd, tab: v }); if (v === "saved") library.list().then(setLib); }} />
+        {snd.tab === "library" && (
+          <>
+            <p className="note">Built-in effects, made on your device. Tap ▶ to hear, + to add at the playhead.</p>
+            <div className="slist">
+              {SFX.map((fx) => (
+                <div key={fx.id} className="srow">
+                  <button className="sbtn" aria-label={"Preview " + fx.name} onClick={async () => preview(URL.createObjectURL(await renderSfx(fx.id)), fx.id)}>
+                    {playingKey === fx.id ? <Pause size={16} /> : <Play size={16} />}
+                  </button>
+                  <span className="stitle">{fx.name}<small>{fx.secs.toFixed(1)}s</small></span>
+                  <button className="sbtn add" aria-label={"Add " + fx.name} disabled={busy} onClick={() => addSfx(fx.id)}><Plus size={18} /></button>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {snd.tab === "search" && (
+          <>
+            <form className="sform" onSubmit={(e) => { e.preventDefault(); runSearch(); }}>
+              <input type="search" enterKeyHint="search" placeholder={snd.cat === "music" ? "lofi, upbeat, cinematic…" : "whoosh, applause, rain…"} value={snd.q} onChange={(e) => setSnd({ ...snd, q: e.target.value })} />
+              <button className="sbtn add" aria-label="Search"><Search size={18} /></button>
+            </form>
+            <Chips items={[{ k: "music", label: "Music" }, { k: "sound_effect", label: "Sound effects" }] as { k: typeof snd.cat; label: string }[]} value={snd.cat} onChange={(v) => setSnd({ ...snd, cat: v, hits: [] })} />
+            <p className="note">Free-to-use Creative Commons tracks from Jamendo and Freesound. Downloads are saved on this phone.</p>
+            {snd.loading && <p className="note">Searching…</p>}
+            <div className="slist">
+              {snd.hits.map((h) => (
+                <div key={h.id} className="srow">
+                  <button className="sbtn" aria-label={"Preview " + h.title} onClick={() => preview(h.url, h.id)}>{playingKey === h.id ? <Pause size={16} /> : <Play size={16} />}</button>
+                  <span className="stitle">{h.title}<small>{h.creator} · {P.fmtLen(h.duration)} · {licenseName(h.license)}</small></span>
+                  <button className="sbtn add" aria-label={"Download " + h.title} disabled={!!snd.getting} onClick={() => addHit(h)}>{snd.getting === h.id ? "…" : <Download size={17} />}</button>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+        {snd.tab === "saved" && (
+          <>
+            <button className="btn gray" onClick={() => musicRef.current?.click()}><FolderOpen size={16} style={{ verticalAlign: -3, marginRight: 6 }} />Import audio from Files</button>
+            {!lib.length && <p className="note">Sounds you download or import are kept here, on this phone, for every project.</p>}
+            <div className="slist">
+              {lib.map((it) => (
+                <div key={it.id} className="srow">
+                  <button className="sbtn" aria-label={"Preview " + it.name} onClick={async () => { const a = await loadAsset(it.id); if (a) preview(URL.createObjectURL(a.blob), it.id); }}>{playingKey === it.id ? <Pause size={16} /> : <Play size={16} />}</button>
+                  <span className="stitle">{it.name}<small>{it.kind === "sfx" ? "Effect" : "Music"} · {P.fmtLen(it.duration)}{it.credit ? ` · ${it.credit}` : ""}</small></span>
+                  <button className="sbtn" aria-label={"Remove " + it.name} onClick={async () => { await library.remove(it.id); setLib(await library.list()); }}><Trash2 size={16} /></button>
+                  <button className="sbtn add" aria-label={"Add " + it.name} onClick={() => addSound(it.id, it.duration, it.kind, it.name)}><Plus size={18} /></button>
+                </div>
+              ))}
+            </div>
           </>
         )}
       </Sheet>
@@ -1089,7 +1300,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
         <Tool icon={<LayoutTemplate size={I} />} label="Templates" onClick={() => setPanel("templates")} />
         <Tool icon={<Captions size={I} />} label="Captions" onClick={() => setPanel("captions")} />
         <Tool icon={<WandSparkles size={I} />} label="Auto cut" onClick={() => { setCut({ ...cut, scope: "all" }); setPanel("autocut"); }} />
-        <Tool icon={<Music size={I} />} label="Music" onClick={() => setPanel("music")} />
+        <Tool icon={<Music size={I} />} label="Sounds" onClick={() => setPanel("sounds")} />
         <Tool icon={<Sparkles size={I} />} label="Effects" onClick={() => p.clips[0] ? (setSel({ type: "clip", id: p.clips[Math.max(0, clipAt(T()))].id }), setPanel("filters")) : flash("Add a clip first")} />
         <Tool icon={<Crop size={I} />} label="Canvas" onClick={() => setPanel("canvas")} />
         <Tool icon={<Scissors size={I} />} label="Split" onClick={split} />
@@ -1100,16 +1311,29 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
   // ---------------------------------------------------------------- timeline
 
   const end = Math.max(lay.end, 1);
+  // Overlapping music / effects stack into lanes.
+  const lanes = { of: {} as Record<string, number>, n: 1 };
+  {
+    const ends: number[] = [];
+    [...p.music].sort((a, b) => a.start - b.start).forEach((m) => {
+      let l = ends.findIndex((e) => e <= m.start + 0.001);
+      if (l < 0) { l = ends.length; ends.push(0); }
+      ends[l] = m.start + m.out - m.in;
+      lanes.of[m.id] = l;
+    });
+    lanes.n = Math.min(4, Math.max(1, ends.length));
+    for (const id in lanes.of) lanes.of[id] = Math.min(lanes.of[id], 3);
+  }
   const step = [0.5, 1, 2, 5, 10, 30, 60].find((s) => s * pps >= 56) ?? 120;
   const half = "50vw";
   const ticks: number[] = [];
   for (let t = 0; t <= end + step; t += step) ticks.push(t);
 
   return (
-    <div className="ed" onPointerMove={onDragMove} onPointerUp={endDrag} onPointerCancel={endDrag}>
-      <input ref={fileRef} type="file" accept="video/*,image/*" multiple hidden onChange={(e) => { addMedia(e.target.files); e.target.value = ""; }} />
-      <input ref={musicRef} type="file" accept="audio/*,video/*" hidden onChange={(e) => { addMusic(e.target.files); e.target.value = ""; }} />
-      <input ref={bgImgRef} type="file" accept="image/*" hidden onChange={(e) => { setBgImage(e.target.files); e.target.value = ""; }} />
+    <div className="ed" onPointerDownCapture={() => player.current?.unlock()} onPointerMove={onDragMove} onPointerUp={endDrag} onPointerCancel={endDrag}>
+      <input ref={fileRef} type="file" accept="video/*,image/*" multiple hidden onChange={(e) => { const f = Array.from(e.target.files ?? []); e.target.value = ""; addMedia(f); }} />
+      <input ref={musicRef} type="file" accept="audio/*,video/*" hidden onChange={(e) => { const f = Array.from(e.target.files ?? []); e.target.value = ""; addMusic(f); }} />
+      <input ref={bgImgRef} type="file" accept="image/*" hidden onChange={(e) => { const f = Array.from(e.target.files ?? []); e.target.value = ""; setBgImage(f); }} />
 
       <div className="top">
         <button className="icon" aria-label="Projects" onClick={onBack}><ChevronLeft /></button>
@@ -1137,7 +1361,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
         </span>
       </div>
 
-      <div className="tlwrap">
+      <div className="tlwrap" style={{ height: 168 + (lanes.n - 1) * 26 }}>
         <div className="tl" ref={tlRef} data-pps={pps} onScroll={onTlScroll}>
           <div className="tl-inner" style={{ width: `calc(${end * pps}px + 100vw)`, paddingLeft: half }}>
             <div className="ruler" style={{ left: half }}>
@@ -1166,7 +1390,7 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
                   <Blend size={13} />
                 </button>
               ))}
-              <button className="addbtn" aria-label="Add media" style={{ left: lay.videoEnd * pps + 10 }} onClick={() => fileRef.current?.click()}><Plus size={20} /></button>
+              {p.clips.length > 0 && <button className="addbtn" aria-label="Add media" style={{ left: lay.videoEnd * pps + 10 }} onClick={() => fileRef.current?.click()}><Plus size={20} /></button>}
             </div>
             {[{ cap: false, top: 82 }, { cap: true, top: 108 }].map(({ cap: isCap, top }) => (
               <div key={top} className="track" style={{ top, height: 22, left: half }}>
@@ -1188,11 +1412,11 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
                 })}
               </div>
             ))}
-            <div className="track" style={{ top: 134, height: 22, left: half }}>
+            <div className="track" style={{ top: 134, height: 22 + (lanes.n - 1) * 26, left: half }}>
               {p.music.map((m) => {
                 const on = selMusic?.id === m.id;
                 return (
-                  <div key={m.id} className={"item music" + (on ? " sel" : "")} style={{ left: m.start * pps, width: Math.max(8, (m.out - m.in) * pps - 1) }}
+                  <div key={m.id} className={"item music" + (m.vo ? " vo" : "") + (on ? " sel" : "")} style={{ left: m.start * pps, top: lanes.of[m.id] * 26, height: 22, width: Math.max(8, (m.out - m.in) * pps - 1) }}
                     onClick={() => !on && setSel({ type: "music", id: m.id })}
                     onPointerDown={(e) => on && startDrag(e, "mMove", m.id, { start: m.start, in: m.in, out: m.out })}>
                     ♪ {assets[m.assetId]?.name ?? "Music"}
@@ -1210,13 +1434,13 @@ function Editor({ id, onBack }: { id: string; onBack: () => void }) {
         </div>
         <div className="playhead" />
         {!p.clips.length && (
-          <button className="pill" style={{ position: "absolute", left: "50%", top: "50%", transform: "translate(8px,-50%)", zIndex: 7 }} onClick={() => fileRef.current?.click()}>
+          <button className="pill emptyadd" onClick={() => fileRef.current?.click()}>
             <ImagePlus size={16} style={{ verticalAlign: -3, marginRight: 6 }} />Add videos
           </button>
         )}
       </div>
 
-      <div className="tools">{tools}</div>
+      <div className="tools" key={sel?.type ?? "main"}>{tools}</div>
 
       {panel && panel !== "export" && !recMode && panels[panel]?.()}
 
