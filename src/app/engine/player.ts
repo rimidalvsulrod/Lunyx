@@ -67,6 +67,7 @@ export class Player {
   private fontWait = new Set<string>();
   private hadMask = false;
   private endResolve: (() => void) | null = null;
+  private preroll = false;
   private blessed = new WeakSet<HTMLMediaElement>();
 
   canvas = document.createElement("canvas");
@@ -304,8 +305,35 @@ export class Player {
     this.T0 = this.time;
     this.t0 = performance.now();
     this.onState(true);
+    // Pre-roll: start the video elements now (inside the tap) but hold the clock until they are
+    // really decoding frames, then start the clock from where the video actually is.
+    // Otherwise the clock runs ahead of a cold decoder, causing a stutter and audio that trails.
+    this.preroll = true;
+    this.syncMedia(this.time);
+    const startAt = performance.now();
+    const startT = this.time;
     const loop = (now: number) => {
       if (!this.playing) return;
+      if (this.preroll) {
+        const act0 = this.active(startT);
+        const d = act0 ? this.decks[act0.a % 2] : null;
+        const c0 = act0 ? this.project.clips[act0.a] : null;
+        const isVideo = !!d && !!c0 && !d.img && d.assetId === c0.assetId;
+        const ready = !isVideo || (!d!.el.seeking && d!.el.readyState >= 3 && !d!.el.paused && d!.el.currentTime > c0!.in + 0.02) || (d!.el.readyState >= 3 && c0!.in <= 0.02 && d!.el.currentTime > 0.03);
+        if (!ready && now - startAt < 1500) {
+          if (isVideo && d!.el.paused && !d!.el.seeking) d!.el.play().catch(() => {});
+          this.render(startT);
+          this.raf = requestAnimationFrame(loop);
+          return;
+        }
+        this.preroll = false;
+        let T0 = startT;
+        if (isVideo && ready && act0) T0 = this.lay.starts[act0.a] + (d!.el.currentTime - c0!.in) / c0!.speed;
+        this.T0 = T0;
+        this.t0 = now;
+        this.time = T0;
+        this.syncMedia(T0);
+      }
       let T = this.T0 + (now - this.t0) / 1000;
       // Lock the clock to the playing video so captions stay on the words.
       const act = this.active(T);
@@ -340,6 +368,7 @@ export class Player {
 
   pause() {
     this.playing = false;
+    this.preroll = false;
     cancelAnimationFrame(this.raf);
     for (const d of this.decks) { d.el.pause(); d.gain?.gain.setTargetAtTime(0, this.ac!.currentTime, 0.02); }
     for (const m of this.music.values()) m.el.pause();
@@ -396,7 +425,7 @@ export class Player {
       }
     });
     // Music
-    for (const m of p.music) {
+    for (const m of this.preroll ? [] : p.music) {
       let mm = this.music.get(m.id);
       const a = cachedAsset(m.assetId);
       if (!mm && a) {
